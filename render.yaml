@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: lecture-saver-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.12
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: DAILY_LIMIT
+        value: 5
+      - key: DATABASE_PATH
+        value: database.db
