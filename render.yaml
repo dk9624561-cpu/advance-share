@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: lecture-saver-bot
+    name: advance-share
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
@@ -10,8 +10,6 @@ services:
         value: 3.10.12
       - key: BOT_TOKEN
         sync: false
-      - key: ADMIN_USER_ID
-        value: "8711649755"
       - key: DAILY_LIMIT
         value: "5"
       - key: DATABASE_PATH
