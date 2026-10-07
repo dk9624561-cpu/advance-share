@@ -85,6 +85,7 @@ async def post_init(application) -> None:
         BotCommand("start", "🚀 Start the bot or request a file"),
         BotCommand("help", "❓ Show all available commands"),
         BotCommand("add_mapping", "🔗 Link a source channel to destination"),
+        BotCommand("index_channel", "🔄 Index existing lectures/PDFs in channel"),
         BotCommand("remove_mapping", "❌ Remove a channel mapping link"),
         BotCommand("add_user", "👤 Add/renew user membership access"),
         BotCommand("remove_user", "🚫 Revoke/delete user membership"),
@@ -218,7 +219,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     if is_admin_user:
         help_text += "🔑 **Admin Commands:**\n"
-        help_text += "• `/add_mapping <source_id> <dest_id>` - Link channel A to B\n"
+        help_text += "• `/add_mapping <source_id> <dest_id>` - Link channel A to B (and index existing content)\n"
+        help_text += "• `/index_channel <source_id> [start_msg_id]` - Index pre-existing lectures/PDFs\n"
         help_text += "• `/remove_mapping <source_id>` - Remove channel link\n"
         help_text += "• `/add_user <user_id> <days>` - Add/renew subscriber\n"
         help_text += "• `/remove_user <user_id>` - Remove subscriber\n"
@@ -231,8 +233,153 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
+async def index_channel_messages(
+    context: ContextTypes.DEFAULT_TYPE,
+    admin_chat_id: int,
+    source_channel_id: int,
+    destination_channel_id: int,
+    start_id: int = 1,
+    max_consecutive_errors: int = 50
+) -> None:
+    """Indexes pre-existing messages from a source channel into the destination channel and database."""
+    logger.info(f"Starting indexing for source channel {source_channel_id} -> {destination_channel_id} starting from msg_id {start_id}")
+    
+    status_msg = await safe_send_message(
+        context,
+        chat_id=admin_chat_id,
+        text=f"🔄 **Indexing Started!**\n\n"
+             f"📢 **Source:** `{source_channel_id}`\n"
+             f"📖 **Destination:** `{destination_channel_id}`\n"
+             f"Searching for existing lectures/PDFs starting from msg ID `{start_id}`...",
+        parse_mode="Markdown"
+    )
+    
+    current_id = start_id
+    consecutive_errors = 0
+    indexed_count = 0
+    skipped_count = 0
+    
+    while consecutive_errors < max_consecutive_errors:
+        # Check if already indexed in DB
+        if database.is_lecture_indexed(source_channel_id, current_id):
+            skipped_count += 1
+            consecutive_errors = 0
+            current_id += 1
+            continue
+            
+        try:
+            # Forward message to admin chat temporarily to inspect text/caption/HTML formatting
+            fwd_msg = await context.bot.forward_message(
+                chat_id=admin_chat_id,
+                from_chat_id=source_channel_id,
+                message_id=current_id
+            )
+            
+            # Reset consecutive errors since message exists
+            consecutive_errors = 0
+            
+            # Delete temporary forwarded message immediately from admin chat
+            try:
+                await context.bot.delete_message(chat_id=admin_chat_id, message_id=fwd_msg.message_id)
+            except Exception as e:
+                logger.warning(f"Could not delete temp fwd message {fwd_msg.message_id}: {e}")
+                
+            # Extract text/caption or filename
+            raw_text = fwd_msg.caption or fwd_msg.text
+            title_html = fwd_msg.caption_html or fwd_msg.text_html
+            
+            # If no text/caption but has a document, video, or photo, use filename or description
+            if not raw_text:
+                if fwd_msg.document:
+                    raw_text = fwd_msg.document.file_name or "PDF / Document"
+                elif fwd_msg.video:
+                    raw_text = fwd_msg.video.file_name or "Lecture Video"
+                elif fwd_msg.photo:
+                    raw_text = "Lecture Photo"
+                elif fwd_msg.audio:
+                    raw_text = fwd_msg.audio.title or fwd_msg.audio.file_name or "Lecture Audio"
+            
+            # If message has content to index
+            if raw_text or fwd_msg.document or fwd_msg.video or fwd_msg.photo or fwd_msg.audio:
+                video_title, _ = parse_lecture_info(raw_text or "")
+                if not title_html:
+                    title_html = html.escape(video_title or "Untitled Lecture/Media")
+                    
+                # Generate unique file code
+                while True:
+                    file_code = secrets.token_hex(4)
+                    if not database.get_lecture(file_code):
+                        break
+                        
+                # Add lecture to database
+                db_success = database.add_lecture(
+                    file_code=file_code,
+                    source_chat_id=source_channel_id,
+                    source_message_id=current_id,
+                    title=video_title
+                )
+                
+                if db_success:
+                    index_text = title_html
+                    keyboard = [
+                        [InlineKeyboardButton("Get Lecture 📥", callback_data=f"get_{file_code}")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    await safe_send_message(
+                        context=context,
+                        chat_id=destination_channel_id,
+                        text=index_text,
+                        reply_markup=reply_markup,
+                        parse_mode="HTML"
+                    )
+                    indexed_count += 1
+                    logger.info(f"Indexed existing message ID {current_id} (code: {file_code})")
+                    
+        except RetryAfter as e:
+            logger.warning(f"Rate limit hit during indexing msg {current_id}. Sleeping {e.retry_after}s...")
+            await asyncio.sleep(e.retry_after)
+            continue  # Retry same message ID
+        except Exception as e:
+            err_str = str(e)
+            if "Message to forward not found" in err_str or "Message can't be forwarded" in err_str or "message to delete not found" in err_str:
+                consecutive_errors += 1
+            else:
+                logger.warning(f"Error checking message {current_id}: {e}")
+                consecutive_errors += 1
+                
+        current_id += 1
+        
+        # Edit progress message every 10 indexed items
+        if indexed_count > 0 and indexed_count % 10 == 0 and status_msg:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=admin_chat_id,
+                    message_id=status_msg.message_id,
+                    text=f"🔄 **Indexing in Progress...**\n\n"
+                         f"📢 **Source:** `{source_channel_id}`\n"
+                         f"📊 **Newly Indexed:** `{indexed_count}` lectures/PDFs\n"
+                         f"⏩ **Skipped (Already indexed):** `{skipped_count}`\n"
+                         f"🔍 **Currently at Msg ID:** `{current_id}`",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+                
+        await asyncio.sleep(0.4)  # Small delay to prevent Telegram flood limits
+        
+    final_text = (
+        f"✅ **Indexing Complete!**\n\n"
+        f"📢 **Source Channel:** `{source_channel_id}`\n"
+        f"📖 **Destination Channel:** `{destination_channel_id}`\n"
+        f"✨ **Newly Indexed Lectures/PDFs:** `{indexed_count}`\n"
+        f"⏩ **Skipped (Already Indexed):** `{skipped_count}`\n"
+        f"🛑 **Finished at Msg ID:** `{current_id - 1}`"
+    )
+    await safe_send_message(context, chat_id=admin_chat_id, text=final_text, parse_mode="Markdown")
+
 async def add_mapping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Command to map a Source channel to a Destination channel. Allowed for any authorized user/subscriber and admin."""
+    """Command to map a Source channel to a Destination channel and auto-index pre-existing content."""
     user_id = update.effective_user.id
     if not database.is_user_authorized(user_id):
         await update.message.reply_text("❌ You are not authorized to run this command. You must be added to the bot.")
@@ -259,12 +406,49 @@ async def add_mapping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(
             f"✅ **Channel Link Added!**\n\n"
             f"📢 **Source A:** `{source_id}`\n"
-            f"📖 **Index B:** `{dest_id}`",
+            f"📖 **Index B:** `{dest_id}`\n\n"
+            f"🔄 **Auto-indexing of pre-existing lectures & PDFs is starting now...**",
             parse_mode="Markdown"
         )
         logger.info(f"Admin {user_id} added mapping: {source_id} -> {dest_id}")
+        
+        # Trigger background task to scan and index pre-existing channel messages
+        asyncio.create_task(index_channel_messages(context, update.effective_chat.id, source_id, dest_id))
     else:
         await update.message.reply_text("❌ Failed to add mapping to database.")
+
+async def index_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manual command to trigger indexing of pre-existing channel messages."""
+    user_id = update.effective_user.id
+    if not database.is_user_authorized(user_id):
+        await update.message.reply_text("❌ You are not authorized to run this command.")
+        return
+        
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ **Usage:** `/index_channel <source_channel_id> [start_message_id]`\n"
+            "Example: `/index_channel -1001234567890 1`",
+            parse_mode="Markdown"
+        )
+        return
+        
+    try:
+        source_id = int(context.args[0])
+        start_id = int(context.args[1]) if len(context.args) > 1 else 1
+    except ValueError:
+        await update.message.reply_text("❌ Invalid channel ID or message ID. Must be numbers.")
+        return
+        
+    dest_id = database.get_mapping(source_id)
+    if not dest_id:
+        if source_id == config.SOURCE_CHANNEL_ID:
+            dest_id = config.DESTINATION_CHANNEL_ID
+            
+    if not dest_id:
+        await update.message.reply_text(f"❌ No mapping found for source channel `{source_id}`. Please use `/add_mapping` first.", parse_mode="Markdown")
+        return
+        
+    asyncio.create_task(index_channel_messages(context, update.effective_chat.id, source_id, dest_id, start_id=start_id))
 
 async def remove_mapping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin command to remove a source channel mapping."""
@@ -690,6 +874,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("add_mapping", add_mapping))
+    application.add_handler(CommandHandler("index_channel", index_channel))
     application.add_handler(CommandHandler("remove_mapping", remove_mapping))
     application.add_handler(CommandHandler("add_user", add_user))
     application.add_handler(CommandHandler("remove_user", remove_user))

@@ -94,6 +94,19 @@ def get_lecture(file_code: str):
         logger.error(f"Error fetching lecture with code {file_code}: {e}")
         return None
 
+def is_lecture_indexed(source_chat_id: int, source_message_id: int) -> bool:
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM lectures WHERE source_chat_id = ? AND source_message_id = ?",
+                (source_chat_id, source_message_id)
+            )
+            return cursor.fetchone() is not None
+    except Exception as e:
+        logger.error(f"Error checking if lecture is indexed: {e}")
+        return False
+
 def set_setting(key: str, value: str) -> None:
     try:
         with get_db_connection() as conn:
